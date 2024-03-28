@@ -1573,11 +1573,7 @@ class DownBlockTriplane(nn.Module):
 
         if add_downsample:
             self.downsamplers = nn.ModuleList(
-                [
-                    DownsampleTriplane(
-                        out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
-                    )
-                ]
+                [DownsampleTriplane(out_channels, out_channels=out_channels, padding=downsample_padding)]
             )
         else:
             self.downsamplers = None
@@ -3001,7 +2997,7 @@ class UpBlockTriplane(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
         if add_upsample:
-            self.upsamplers = nn.ModuleList([UpsampleTriplane(out_channels, use_conv=True, out_channels=out_channels)])
+            self.upsamplers = nn.ModuleList([UpsampleTriplane(out_channels, out_channels=out_channels)])
         else:
             self.upsamplers = None
 

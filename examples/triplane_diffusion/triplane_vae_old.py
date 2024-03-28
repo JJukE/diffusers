@@ -9,7 +9,7 @@ from diffusers import UNet2DModel
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from .scatter_ops import scatter_mean, scatter_max
-from .point_utils import normalize_3d_coordinate
+from .point_modules import normalize_3d_coordinate
 from .triplane_modules import RFFPointEmbedding, ResnetBlockFC, TriplaneConv
 
 

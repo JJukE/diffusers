@@ -23,7 +23,7 @@ from diffusers.models.modeling_utils import ModelMixin
 # from .triplane_unet_blocks import UNetMidBlockTriplane, get_down_block, get_up_block
 # from .triplane_modules import TriplaneConv
 from triplane_unet_blocks import UNetMidBlockTriplane, get_down_block, get_up_block
-from triplane_modules import TriplaneConv
+from triplane_modules import TriplaneConv, TriplaneGroupNorm, TriplaneSiLU
 
 
 @dataclass
@@ -202,8 +202,8 @@ class UNetTriplaneModel(ModelMixin, ConfigMixin):
 
         # out
         num_groups_out = norm_num_groups if norm_num_groups is not None else min(block_out_channels[0] // 4, 32)
-        self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=num_groups_out, eps=norm_eps)
-        self.conv_act = nn.SiLU()
+        self.conv_norm_out = TriplaneGroupNorm(num_channels=block_out_channels[0], num_groups=num_groups_out, eps=norm_eps)
+        self.conv_act = TriplaneSiLU()
         self.conv_out = TriplaneConv(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
     def forward(
@@ -276,56 +276,55 @@ def __test__():
     import yaml
     from jjuke.net_utils import instantiate_from_config
     
-    # # memory usage: upto 180000 ~ 19000
-    # config = """
-    # target: triplane_unet.UNetTriplaneModel
-    # params:
-    #     triplane_res: 128
-    #     in_channels: 32
-    #     out_channels: 8
-    #     down_block_types: ["DownBlockTriplane", "DownBlockTriplane", "ResnetDownsampleBlockTriplane"]
-    #     up_block_types: ["UpBlockTriplane", "UpBlockTriplane", "ResnetUpsampleBlockTriplane"]
-    #     block_out_channels: [64, 128, 256]
-    #     layers_per_block: 1
-    #     mid_block_scale_factor: 1 # optional
-    #     downsample_padding: 1 # optional
-    #     downsample_type: "conv" # only for AttnDownBlock
-    #     upsample_type: "conv" # only for AttnUpBlock
-    #     dropout: 0. # optional
-    #     act_fn: "silu" # optional
-    #     attention_head_dim: 8 # only for Attention Blocks
-    #     norm_num_groups: 32 # optional
-    #     attn_norm_num_groups: None # optional
-    #     norm_eps: 1.0e-5 # -> 1.0e-6?
-    #     resnet_time_scale_shift: "default" # optional -> only for timeembedding
-    #     add_attention: False # optional
-    # """
-    # config = yaml.safe_load(config)
-    # unet = instantiate_from_config(config).cuda()
-    
-    # x = torch.rand((24, 32, 128, 128), device=unet.device) * 2 - 1 # [-1, 1]
-    # res = unet(x).sample
-    # print(res.shape)
-    
-    # memory usage: oom in 4090
+    # memory usage: upto 170000 ~ 18000
     config = """
     target: triplane_unet.UNetTriplaneModel
     params:
-        # triplane_res: 256
+        triplane_res: 128
         in_channels: 32
         out_channels: 8
-        down_block_types: ["DownBlockTriplane", "ResnetDownsampleBlockTriplane"]
-        up_block_types: ["UpBlockTriplane", "ResnetUpsampleBlockTriplane"]
-        block_out_channels: [32, 64]
+        down_block_types: ["DownBlockTriplane", "DownBlockTriplane", "ResnetDownsampleBlockTriplane"]
+        up_block_types: ["UpBlockTriplane", "UpBlockTriplane", "ResnetUpsampleBlockTriplane"]
+        block_out_channels: [64, 128, 256]
         layers_per_block: 1
+        mid_block_scale_factor: 1 # optional
+        downsample_padding: 1 # optional
+        downsample_type: "conv" # only for AttnDownBlock
+        upsample_type: "conv" # only for AttnUpBlock
+        dropout: 0. # optional
+        act_fn: "silu" # optional
+        attention_head_dim: 8 # only for Attention Blocks
+        norm_num_groups: 32 # optional
+        attn_norm_num_groups: None # optional
+        norm_eps: 1.0e-5 # -> 1.0e-6?
+        resnet_time_scale_shift: "default" # optional -> only for timeembedding
+        add_attention: False # optional
     """
     config = yaml.safe_load(config)
     unet = instantiate_from_config(config).cuda()
     
-    x = torch.rand((24, 32, 256, 256), device=unet.device) * 2 - 1 # [-1, 1]
+    x = torch.rand((24, 32, 128, 128), device=unet.device) * 2 - 1 # [-1, 1]
     res = unet(x).sample
     print(res.shape)
     
+    # # memory usage: oom in 4090
+    # config = """
+    # target: triplane_unet.UNetTriplaneModel
+    # params:
+    #     # triplane_res: 256
+    #     in_channels: 32
+    #     out_channels: 8
+    #     down_block_types: ["DownBlockTriplane", "ResnetDownsampleBlockTriplane"]
+    #     up_block_types: ["UpBlockTriplane", "ResnetUpsampleBlockTriplane"]
+    #     block_out_channels: [32, 64]
+    #     layers_per_block: 1
+    # """
+    # config = yaml.safe_load(config)
+    # unet = instantiate_from_config(config).cuda()
+    
+    # x = torch.rand((24, 32, 256, 256), device=unet.device) * 2 - 1 # [-1, 1]
+    # res = unet(x).sample
+    # print(res.shape)
 
 
 if __name__ == "__main__":

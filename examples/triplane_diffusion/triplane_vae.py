@@ -1,88 +1,131 @@
 """ based on diffusers """
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from diffusers import UNet2DModel
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-from .scatter_ops import scatter_mean, scatter_max
-from .point_utils import normalize_3d_coordinate
-from .triplane_modules import RFFPointEmbedding, ResnetBlockFC, TriplaneConv
+# from .scatter_ops import scatter_mean, scatter_max
+# from .point_modules import normalize_3d_coordinate, RFFPointEmbedding, ResnetBlockFC
+# from triplane_modules import TriplaneConv
+# from .triplane_unet_blocks import ResnetBlockTriplane, DownsampleTriplane, UpsampleTriplane
+# from .triplane_unet import UNetTriplaneModel
+from scatter_ops import scatter_mean, scatter_max
+from point_modules import normalize_3d_coordinate, RFFPointEmbedding, ResnetBlockFC
+from triplane_modules import TriplaneConv
+from triplane_unet_blocks import ResnetBlockTriplane, DownsampleTriplane, UpsampleTriplane
+from triplane_unet import UNetTriplaneModel
 
 
 grid_sample = partial(F.grid_sample, padding_mode="border", align_corners=True)
 
 
-class Downsampler(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        downsample_steps: int = 1,
-        limit_receptive_field: bool = True
-    ):
+class DownSampler(nn.Module):
+    """ Triplane Channel Mixer
+    Concats the triplanes along channels instead of batches. Also, downsample the triplanes for
+    converting them into proper shape of latents.
+    """
+    def __init__(self, channels: int, in_channels: int, out_channels: int, num_sample_steps: int):
         super().__init__()
+
+        self.conv_in = TriplaneConv(in_channels, channels, kernel_size=1, stride=1)
         
-        kernel_sizes = (2, 1) if limit_receptive_field else (3, 3)
-        paddings = (0, 0) if limit_receptive_field else (1, 1)
+        input_channel = channels
         
-        input_channel = in_channels
-        
-        self.blocks = []
-        for _ in range(downsample_steps): # for i, down_block_type in enumerate(down_block_types):
+        resnets, downsamplers = [], []
+        for _ in range(num_sample_steps):
             output_channel = input_channel * 2
-            self.blocks.append(
-                nn.Sequential(
-                    TriplaneConv(input_channel, output_channel, kernel_size=kernel_sizes[0], stride=2, padding=paddings[0]),
-                    nn.LeakyReLU(negative_slope=0.1, inplace=True),
-                    nn.GroupNorm(32, output_channel),
-                    TriplaneConv(input_channel, output_channel, kernel_size=kernel_sizes[1], stride=1, padding=paddings[1]),
-                    nn.LeakyReLU(negative_slope=0.1, inplace=True),
-                    nn.GroupNorm(32, output_channel),
-                )
+            norm_groups = 32 if input_channel > 32 else input_channel
+            resnets.append(
+                ResnetBlockTriplane(in_channels=input_channel, out_channels=output_channel, groups=norm_groups)
+            )
+            downsamplers.append( # padding=0?
+                DownsampleTriplane(channels=output_channel, out_channels=output_channel, padding=1)
             )
             input_channel = output_channel
-        self.blocks = nn.Sequential(*self.blocks)
-            
+        
+        self.resnets = nn.ModuleList(resnets)
+        self.downsamplers = nn.ModuleList(downsamplers)
+
+        self.channel_encoder = nn.Sequential(
+            nn.Conv2d(3*input_channel, out_channels, 1),
+            nn.Conv2d(out_channels, out_channels, 1) # quant_conv
+        )
     
-    def forward(self, input_tensor: torch.FloatTensor) -> torch.FloatTensor:
-        output_tensor = self.blocks(input_tensor)
-        return output_tensor
+    
+    def forward(self, feat_planes: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            feat_planes: (3B, C_in, H_in, W_in)
+        Returns:
+            feat_planes: (B, C_out, H_out, W_out)
+        """
+        feat_planes = self.conv_in(feat_planes)
+        
+        for resnet, sampler in zip(self.resnets, self.downsamplers):
+            feat_planes = resnet(feat_planes, temb=None)
+            feat_planes = sampler(feat_planes)
+        
+        xy_hidden, xz_hidden, yz_hidden = feat_planes.chunk(3, dim=0)
+        feat_planes = torch.cat([xy_hidden, xz_hidden, yz_hidden], dim=1) # (B, 3C, H, W)
+        
+        return self.channel_encoder(feat_planes)
 
 
-class Upsampler(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        upsample_steps: int = 1
-    ):
+class UpSampler(nn.Module):
+    """ UpSampler for triplanes
+    Decodes the latents and concat along batches instead of channels.
+    Also, upsample the latents for converting them into proper shape of triplanes.
+    """
+    def __init__(self, channels: int, in_channels: int, out_channels: int, num_sample_steps: int):
         super().__init__()
+        self.channel_decoder = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 1), # post_quant_conv
+            nn.Conv2d(in_channels, 3*channels, 1)
+        )
         
-        input_channel = in_channels
+        input_channel = channels
         
-        self.blocks = []
-        for _ in range(upsample_steps):
+        resnets, upsamplers = [], []
+        for _ in range(num_sample_steps):
             output_channel = input_channel // 2
-            self.blocks.append(
-                nn.Upsample(scale_factor=2, mode="nearest"),
-                nn.TriplaneConv(input_channel, output_channel, kernel_size=3, stride=1, padding=1),
-                nn.LeakyReLU(negative_slope=0.1, inplace=True),
-                nn.GroupNorm(32, output_channel),
-                nn.TriplaneConv(output_channel, output_channel, kernel_size=3, stride=1, padding=1),
-                nn.LeakyReLU(negative_slope=0.1, inplace=True),
-                nn.GroupNorm(32, output_channel)
+            norm_groups = 32 if output_channel > 32 else output_channel
+            resnets.append(
+                ResnetBlockTriplane(in_channels=input_channel, out_channels=output_channel, groups=norm_groups)
+            )
+            upsamplers.append(
+                UpsampleTriplane(channels=output_channel, out_channels=output_channel)
             )
             input_channel = output_channel
-        self.blocks = nn.Sequential(*self.blocks)
+        
+        self.resnets = nn.ModuleList(resnets)
+        self.upsamplers = nn.ModuleList(upsamplers)
+        
+        self.conv_out = TriplaneConv(output_channel, out_channels, kernel_size=1, stride=1)
     
     
-    def forwrad(self, input_tensor: torch.FloatTensor) -> torch.FloatTensor:
-        output_tensor = self.blocks(input_tensor)
-        return output_tensor
+    def forward(self, feat_planes: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            feat_planes: (B, C_in, H_in, W_in)
+        Returns:
+            feat_planes: (3B, C_out, H_out, W_out)
+        """
+        feat_planes = self.channel_decoder(feat_planes) # (B, 3C, H, W)
+        xy_hidden, xz_hidden, yz_hidden = feat_planes.chunk(3, dim=1)
+        feat_planes = torch.cat([xy_hidden, xz_hidden, yz_hidden], dim=0) # (3B, C, H, W)
+        
+        for resnet, sampler in zip(self.resnets, self.upsamplers):
+            feat_planes = resnet(feat_planes, temb=None)
+            feat_planes = sampler(feat_planes)
+        
+        feat_planes = self.conv_out(feat_planes)
+        
+        return feat_planes
 
-            
+
 class PointEncoder(nn.Module):
     def __init__(
         self,
@@ -98,7 +141,7 @@ class PointEncoder(nn.Module):
         self.padding = padding
         
         self.point_emb = RFFPointEmbedding(2*channels, scale=0.9, pooling="mean")
-        self.resnet_blocks = nn.ModuleList(ResnetBlockFC(2*channels, channels) for _ in range(n_blocks))
+        self.blocks = nn.ModuleList(ResnetBlockFC(2*channels, channels) for _ in range(n_blocks))
         self.proj = nn.Linear(channels, out_channels)
         self.nonlinearity = nn.LeakyReLU(negative_slope=0.1, inplace=True)
     
@@ -199,7 +242,7 @@ class TriplaneDecoder(nn.Module):
 
     Args:
         dim (int): input dimension
-        feat_dim (int): dimension of latent conditioned code c (channels of triplane)
+        channels (int): dimension of latent conditioned code c (channels of triplane)
         hidden_size (int): hidden size of Decoder network
         n_blocks (int): number of blocks ResNetBlockFC layers
         leaky (bool): whether to use leaky ReLUs
@@ -222,8 +265,8 @@ class TriplaneDecoder(nn.Module):
         self.n_blocks = n_blocks
         self.padding = padding
 
-        self.proj_c = nn.ModuleList([nn.Linear(channels, hidden_size) for i in range(n_blocks)])
         self.point_emb = RFFPointEmbedding(hidden_size, scale=0.9, pooling="mean") # TODO: use PE or not? # self.proj_p = nn.Linear(3, hidden_size)
+        self.proj_c = nn.ModuleList([nn.Linear(channels, hidden_size) for i in range(n_blocks)])
         self.blocks = nn.ModuleList([ResnetBlockFC(hidden_size) for i in range(n_blocks)])
         self.proj_out = nn.Linear(hidden_size, dim_out)
         self.nonlinearity = nn.LeakyReLU(negative_slope=0.1, inplace=True)
@@ -264,36 +307,25 @@ class TriplaneDecoder(nn.Module):
         return out
 
 
-# TODO: TriplaneVAE
 class TriplaneVAE(nn.Module):
     def __init__(
         self,
-        latent_channels: int,
-        latent_res: int = 64,
-        
-        # point encoder
+        triplane_res: int, # = 128,
+        triplane_channels: int, # = 32,
+        latent_channels: int, # = 4,
         pt_enc_channels: int,
-        pt_channels: int,
-        triplane_res: int = 128,
+        pt_enc_num_blocks: int = 5,
         padding: float = 0.1, # conventional padding parameter of OccNet for unit cube
-        
-        # downsampler
-        downsample_steps: int = 1,
-        
-        # unet
-        in_channels: int = 3,
-        out_channels: int = 3,
-        
-        # upsampler
-        upsample_steps: int = 1,
-        
-        # decoder
-        dim_out: int = 1,
-        channels: int = 128,
-        hidden_size: int = 256,
+        downsampler_channels: int = 128,
+        upsampler_channels: int = 256,
+        num_sample_steps: int = 1,
+        unet_down_block_types: Tuple[str] = ("DownBlockTriplane", "ResnetDownsampleBlockTriplane"),
+        unet_up_block_types: Tuple[str] = ("UpBlockTriplane", "ResnetUpsampleBlockTriplane"),
+        unet_block_out_channels: Tuple[int] = (32, 64),
+        dec_dim_out: int = 1,
+        dec_hidden_size: int = 256,
         n_blocks: int = 5,
         # plane_aggregation: str = "sum",
-        
         kl_weight: float = 1e-6,
         scaling_factor: float = None,
     ):
@@ -305,52 +337,51 @@ class TriplaneVAE(nn.Module):
         
         self.point_encoder = PointEncoder(
             channels=pt_enc_channels,
-            out_channels=pt_channels,
-            n_blocks=5,
+            out_channels=triplane_channels,
+            n_blocks=pt_enc_num_blocks,
             triplane_res=triplane_res,
             padding=padding
         )
         
-        self.downsampler = Downsampler(
-            in_channels=pt_channels,
-            downsample_steps=downsample_steps,
-            limit_receptive_field=True
+        enc_latent_channels = 2*latent_channels if kl_weight > 0 else latent_channels
+        self.enc_unet = UNetTriplaneModel(
+            triplane_res=triplane_res,
+            in_channels=triplane_channels,
+            out_channels=enc_latent_channels,
+            down_block_types=unet_down_block_types,
+            up_block_types=unet_up_block_types,
+            block_out_channels=unet_block_out_channels,
+            layers_per_block=1
         )
         
-        inter_channel = pt_channels * (2**downsample_steps)
-        if kl_weight > 0:
-            self.channel_encoder = nn.Sequential(
-                nn.Conv2d(inter_channel, 2*latent_channels, 1),
-                nn.Conv2d(2*latent_channels, 2 * latent_channels, 1) # quant_conv
-            )
-        else:
-            self.channel_encoder = nn.Sequential(
-                nn.Conv2d(inter_channel, latent_channels, 1),
-                nn.Conv2d(latent_channels, latent_channels, 1) # quant_conv
-            )
+        self.downsampler = DownSampler(
+            channels=downsampler_channels,
+            in_channels=enc_latent_channels,
+            out_channels=enc_latent_channels,
+            num_sample_steps=num_sample_steps
+        )
 
-        # self.channel_decoder = nn.Sequential(
-        #     nn.Conv2d(latent_channels, latent_channels, 1), # post_quant_conv
-        #     nn.Conv2d(latent_channels, 3*inter_channel, 1)
-        # )
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1)
-        
-        self.unet = TriplaneUNet(
-            sample_size=latent_res,
+        self.upsampler = UpSampler(
+            channels=upsampler_channels,
             in_channels=latent_channels,
-            out_channels=3*inter_channel
-            time_embedding_type=
+            out_channels=latent_channels,
+            num_sample_steps=num_sample_steps
         )
         
-        self.upsampler = Upsampler(
-            in_channels=inter_channel,
-            upsample_steps=upsample_steps
+        self.dec_unet = UNetTriplaneModel(
+            triplane_res=triplane_res,
+            in_channels=latent_channels,
+            out_channels=dec_hidden_size,
+            down_block_types=unet_down_block_types,
+            up_block_types=unet_up_block_types,
+            block_out_channels=unet_block_out_channels,
+            layers_per_block=1
         )
         
         self.decoder = TriplaneDecoder(
-            dim_out=dim_out,
-            channels=channels,
-            hidden_size=hidden_size,
+            dim_out=dec_dim_out,
+            channels=triplane_channels,
+            hidden_size=dec_hidden_size,
             n_blocks=n_blocks,
             padding=padding
         )
@@ -359,14 +390,12 @@ class TriplaneVAE(nn.Module):
     def encode(self, input_pts: torch.Tensor, deterministic: bool = False):
         feat_planes, feat = self.point_encoder(input_pts) # (3B, C, H, W), (B, N, C)
         triplane = feat_planes.clone() # (3B, C, H, W)
+        feat_planes = self.enc_unet(feat_planes).sample
         
         bs, ch, height, width = feat_planes.shape
         assert bs % 3 == 0
         
-        feat_planes = self.downsampler(feat_planes) # (3B, C_inter, h, w)
-        # feat_planes = self.unet(feat_planes)
-        feat_planes = feat_planes.reshape(bs//3, 3*ch, height, width) # (B, 3*C_inter, h, w)
-        feat_planes = self.channel_encoder(feat_planes) # (B, 2*latent_dim, h, w)
+        feat_planes = self.downsampler(feat_planes)
         
         if self.kl_weight > 0:
             posterior = DiagonalGaussianDistribution(feat_planes, deterministic=deterministic)
@@ -381,11 +410,8 @@ class TriplaneVAE(nn.Module):
     def decode1(self, z: torch.Tensor):
         # z: (B, latent_channels, h, w)
         z = z / self.scaling_factor if self.scaling_factor is not None else z # for jjuke_diffusion
-        z = self.unet(self.post_quant_conv(z)) # (B, 3*C_inter, h, w)
-        assert z.shape[1] % 3 == 0
-        
-        z = z.reshape(z.shape[0] * 3, z.shape[1] // 3, z.shape[2], z.shape[3]) # (3B, C_inter, h, w)
-        return self.upsampler(z) # (3B, C, H, W)
+        z = self.upsampler(z) # (3B, C, H, W)
+        return self.dec_unet(z).sample
     
     
     def decode2(self, feat_planes: torch.Tensor, query_pts: torch.Tensor):
@@ -427,30 +453,45 @@ def __test__():
     import yaml
     from jjuke.net_utils import instantiate_from_config
     
-    config_1 = """
-    target: triplane_modules.ResnetBlockFC
+    # memory usage: 19000 ~ 20000
+    config = """
+    target: triplane_vae.TriplaneVAE
     params:
-        size_in: 64
-        size_out: 32
-        size_h: Null
+        triplane_res: 128
+        triplane_channels: 32
+        latent_channels: 4
+        pt_enc_channels: 32
+        pt_enc_num_blocks: 5
+        downsampler_channels: 64
+        upsampler_channels: 128
+        num_sample_steps: 1
+        unet_down_block_types: ["DownBlockTriplane", "ResnetDownsampleBlockTriplane"]
+        unet_up_block_types: ["UpBlockTriplane", "ResnetUpsampleBlockTriplane"]
+        unet_block_out_channels: [32, 64]
+        dec_dim_out: 1
+        dec_hidden_size: 32
+        n_blocks: 5
+        # plane_aggregation: "sum"
+        kl_weight: 1.0e-6
+        scaling_factor: Null
     """
-    config_1 = yaml.safe_load(config_1)
-    resblock_1 = instantiate_from_config(config_1)
+    config = yaml.safe_load(config)
+    model = instantiate_from_config(config).cuda()
     
-    config_2 = """
-    target: diffusers.ResnetBlockCondNorm2D
-    params:
-        size_in: 32
-        size_out: Null
-        size_h: Null
+    pts = torch.rand((8, 16384, 3)).cuda() * 2 - 1 # [-1, 1]
+    pts_prove = torch.rand((8, 4096, 3)).cuda() * 2 - 1 # [-1, 1]
+    res_occ, res_posterior, res_enc_triplane, res_dec_triplane = model(pts, query_pts=pts_prove)
+    print("occ.shape: ", res_occ.shape)
+    print("latent shape: ", res_posterior.sample().shape)
+    print("enc_triplane.shape: ", res_enc_triplane.shape)
+    print("dec_triplane.shape: ", res_dec_triplane.shape)
+    
+    """ Results
+    occ.shape:  torch.Size([8, 4096, 1])
+    latent shape:  torch.Size([8, 4, 64, 64])
+    enc_triplane.shape:  torch.Size([24, 32, 128, 128])
+    dec_triplane.shape:  torch.Size([24, 32, 128, 128])
     """
-    config_2 = yaml.safe_load(config_2)
-    resblock_2 = instantiate_from_config(config_2)
-    
-    x_1 = torch.rand((8, 2048, 3)) * 2 - 1 # [-1, 1]
-    res_1 = resblock_1(x_1)
-    
-    
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ from diffusers.models.upsampling import (  # noqa
     upfirdn2d_native,
     upsample_2d,
 )
-from triplane_modules import TriplaneConv
+from triplane_modules import TriplaneConv, TriplaneConvTranspose, TriplaneGroupNorm, TriplaneSiLU
 # from .triplane_modules import TriplaneConv
 
 
@@ -260,18 +260,18 @@ class ResnetBlockCondNormTriplane(nn.Module):
             groups_out = groups
 
         if self.time_embedding_norm == "ada_group":  # ada_group
-            self.norm1 = AdaGroupNorm(temb_channels, in_channels, groups, eps=eps)
+            self.norm1 = AdaGroupNorm(temb_channels, in_channels, groups, eps=eps) # TODO
         elif self.time_embedding_norm == "spatial":
-            self.norm1 = SpatialNorm(in_channels, temb_channels)
+            self.norm1 = SpatialNorm(in_channels, temb_channels) # TODO
         else:
             raise ValueError(f" unsupported time_embedding_norm: {self.time_embedding_norm}")
 
         self.conv1 = conv_cls(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if self.time_embedding_norm == "ada_group":  # ada_group
-            self.norm2 = AdaGroupNorm(temb_channels, out_channels, groups_out, eps=eps)
+            self.norm2 = AdaGroupNorm(temb_channels, out_channels, groups_out, eps=eps) # TODO
         elif self.time_embedding_norm == "spatial":  # spatial
-            self.norm2 = SpatialNorm(out_channels, temb_channels)
+            self.norm2 = SpatialNorm(out_channels, temb_channels) # TODO
         else:
             raise ValueError(f" unsupported time_embedding_norm: {self.time_embedding_norm}")
 
@@ -280,13 +280,13 @@ class ResnetBlockCondNormTriplane(nn.Module):
         conv_2d_out_channels = conv_2d_out_channels or out_channels
         self.conv2 = conv_cls(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
-        self.nonlinearity = get_activation(non_linearity)
+        self.nonlinearity = TriplaneSiLU()
 
         self.upsample = self.downsample = None
         if self.up:
-            self.upsample = Upsample2D(in_channels, use_conv=False)
+            self.upsample = UpsampleTriplane(in_channels)
         elif self.down:
-            self.downsample = Downsample2D(in_channels, use_conv=False, padding=1, name="op")
+            self.downsample = DownsampleTriplane(in_channels, padding=1)
 
         self.use_in_shortcut = self.in_channels != conv_2d_out_channels if use_in_shortcut is None else use_in_shortcut
 
@@ -595,7 +595,7 @@ class ResnetBlockTriplane(nn.Module):
         out_channels: Optional[int] = None,
         conv_shortcut: bool = False,
         dropout: float = 0.0,
-        temb_channels: int = 512,
+        temb_channels: int = None,
         groups: int = 32,
         groups_out: Optional[int] = None,
         pre_norm: bool = True,
@@ -638,7 +638,7 @@ class ResnetBlockTriplane(nn.Module):
         if groups_out is None:
             groups_out = groups
 
-        self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
+        self.norm1 = TriplaneGroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
 
         self.conv1 = conv_cls(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
@@ -652,13 +652,13 @@ class ResnetBlockTriplane(nn.Module):
         else:
             self.time_emb_proj = None
 
-        self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
+        self.norm2 = TriplaneGroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
 
         self.dropout = torch.nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
         self.conv2 = conv_cls(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
-        self.nonlinearity = get_activation(non_linearity)
+        self.nonlinearity = TriplaneSiLU()
 
         self.upsample = self.downsample = None
         if self.up:
@@ -668,7 +668,7 @@ class ResnetBlockTriplane(nn.Module):
             elif kernel == "sde_vp":
                 self.upsample = partial(F.interpolate, scale_factor=2.0, mode="nearest")
             else:
-                self.upsample = Upsample2D(in_channels, use_conv=False)
+                self.upsample = UpsampleTriplane(in_channels)
         elif self.down:
             if kernel == "fir":
                 fir_kernel = (1, 3, 3, 1)
@@ -676,7 +676,7 @@ class ResnetBlockTriplane(nn.Module):
             elif kernel == "sde_vp":
                 self.downsample = partial(F.avg_pool2d, kernel_size=2, stride=2)
             else:
-                self.downsample = Downsample2D(in_channels, use_conv=False, padding=1, name="op")
+                self.downsample = DownsampleTriplane(in_channels, padding=1)
 
         self.use_in_shortcut = self.in_channels != conv_2d_out_channels if use_in_shortcut is None else use_in_shortcut
 
@@ -709,23 +709,23 @@ class ResnetBlockTriplane(nn.Module):
                 hidden_states = hidden_states.contiguous()
             input_tensor = (
                 self.upsample(input_tensor, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
+                if isinstance(self.upsample, UpsampleTriplane)
                 else self.upsample(input_tensor)
             )
             hidden_states = (
                 self.upsample(hidden_states, scale=scale)
-                if isinstance(self.upsample, Upsample2D)
+                if isinstance(self.upsample, UpsampleTriplane)
                 else self.upsample(hidden_states)
             )
         elif self.downsample is not None:
             input_tensor = (
                 self.downsample(input_tensor, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
+                if isinstance(self.downsample, DownsampleTriplane)
                 else self.downsample(input_tensor)
             )
             hidden_states = (
                 self.downsample(hidden_states, scale=scale)
-                if isinstance(self.downsample, Downsample2D)
+                if isinstance(self.downsample, DownsampleTriplane)
                 else self.downsample(hidden_states)
             )
 
@@ -783,28 +783,25 @@ def rearrange_dims(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class DownsampleTriplane(nn.Module):
-    """A 2D downsampling layer with an optional convolution that deals with triplanes (from downsampling.py).
+    """A 2D downsampling layer that deals with triplanes (based on downsampling.py).
 
     Parameters:
         channels (`int`):
             number of channels in the inputs and outputs.
         use_conv (`bool`, default `False`):
-            option to use a convolution.
+            option to use a convolution. (deprecated)
         out_channels (`int`, optional):
             number of output channels. Defaults to `channels`.
         padding (`int`, default `1`):
             padding for the convolution.
-        name (`str`, default `conv`):
-            name of the downsampling 2D layer.
     """
 
     def __init__(
         self,
         channels: int,
-        use_conv: bool = False,
+        # use_conv: bool = False,
         out_channels: Optional[int] = None,
         padding: int = 1,
-        name: str = "conv",
         kernel_size=3,
         norm_type=None,
         eps=None,
@@ -814,37 +811,26 @@ class DownsampleTriplane(nn.Module):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
-        self.use_conv = use_conv
+        # self.use_conv = use_conv
+        # assert use_conv
+        
         self.padding = padding
         stride = 2
-        self.name = name
         conv_cls = TriplaneConv # if USE_PEFT_BACKEND else LoRACompatibleConv
 
         if norm_type == "ln_norm":
             self.norm = nn.LayerNorm(channels, eps, elementwise_affine)
-        elif norm_type == "rms_norm":
-            self.norm = RMSNorm(channels, eps, elementwise_affine)
+        # elif norm_type == "rms_norm":
+        #     self.norm = RMSNorm(channels, eps, elementwise_affine)
         elif norm_type is None:
             self.norm = None
         else:
             raise ValueError(f"unknown norm_type: {norm_type}")
-
-        if use_conv:
-            conv = conv_cls(
-                self.channels, self.out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias
-            )
-        else:
-            assert self.channels == self.out_channels
-            conv = nn.AvgPool2d(kernel_size=stride, stride=stride)
-
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
-        if name == "conv":
-            self.Conv2d_0 = conv
-            self.conv = conv
-        elif name == "Conv2d_0":
-            self.conv = conv
-        else:
-            self.conv = conv
+        
+        self.conv = conv_cls(
+            self.channels, self.out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=bias
+        )
+    
 
     def forward(self, hidden_states: torch.FloatTensor, scale: float = 1.0) -> torch.FloatTensor:
         assert hidden_states.shape[1] == self.channels
@@ -852,7 +838,7 @@ class DownsampleTriplane(nn.Module):
         if self.norm is not None:
             hidden_states = self.norm(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        if self.use_conv and self.padding == 0:
+        if self.padding == 0: # if self.use_conv and self.padding == 0:
             pad = (0, 1, 0, 1)
             hidden_states = F.pad(hidden_states, pad, mode="constant", value=0)
 
@@ -888,11 +874,8 @@ class UpsampleTriplane(nn.Module):
     def __init__(
         self,
         channels: int,
-        use_conv: bool = False,
-        use_conv_transpose: bool = False,
         out_channels: Optional[int] = None,
-        name: str = "conv",
-        kernel_size: Optional[int] = None,
+        kernel_size: int = 3,
         padding=1,
         norm_type=None,
         eps=None,
@@ -903,38 +886,19 @@ class UpsampleTriplane(nn.Module):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
-        self.use_conv = use_conv
-        self.use_conv_transpose = use_conv_transpose
-        self.name = name
+        
         self.interpolate = interpolate
-        conv_cls = TriplaneConv # if USE_PEFT_BACKEND else LoRACompatibleConv
+        conv_cls = TriplaneConvTranspose # if USE_PEFT_BACKEND else LoRACompatibleConv
 
         if norm_type == "ln_norm":
             self.norm = nn.LayerNorm(channels, eps, elementwise_affine)
-        elif norm_type == "rms_norm":
-            self.norm = RMSNorm(channels, eps, elementwise_affine)
         elif norm_type is None:
             self.norm = None
         else:
             raise ValueError(f"unknown norm_type: {norm_type}")
 
-        conv = None
-        if use_conv_transpose:
-            if kernel_size is None:
-                kernel_size = 4
-            conv = nn.ConvTranspose2d(
-                channels, self.out_channels, kernel_size=kernel_size, stride=2, padding=padding, bias=bias
-            )
-        elif use_conv:
-            if kernel_size is None:
-                kernel_size = 3
-            conv = conv_cls(self.channels, self.out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
-
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
-        if name == "conv":
-            self.conv = conv
-        else:
-            self.Conv2d_0 = conv
+        self.conv = conv_cls(self.channels, self.out_channels, kernel_size=kernel_size, stride=2, padding=padding, output_padding=1, bias=bias)
+    
 
     def forward(
         self,
@@ -947,9 +911,6 @@ class UpsampleTriplane(nn.Module):
         if self.norm is not None:
             hidden_states = self.norm(hidden_states.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        if self.use_conv_transpose:
-            return self.conv(hidden_states)
-
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
@@ -957,33 +918,17 @@ class UpsampleTriplane(nn.Module):
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.float32)
 
-        # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-        if hidden_states.shape[0] >= 64:
-            hidden_states = hidden_states.contiguous()
-
-        # if `output_size` is passed we force the interpolation output
-        # size and do not make use of `scale_factor=2`
-        if self.interpolate:
-            if output_size is None:
-                hidden_states = F.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
-            else:
-                hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
+        # # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+        # if hidden_states.shape[0] >= 64:
+        #     hidden_states = hidden_states.contiguous()
 
         # If the input is bfloat16, we cast back to bfloat16
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
 
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
-        if self.use_conv:
-            if self.name == "conv":
-                if isinstance(self.conv, LoRACompatibleConv) and not USE_PEFT_BACKEND:
-                    hidden_states = self.conv(hidden_states, scale)
-                else:
-                    hidden_states = self.conv(hidden_states)
-            else:
-                if isinstance(self.Conv2d_0, LoRACompatibleConv) and not USE_PEFT_BACKEND:
-                    hidden_states = self.Conv2d_0(hidden_states, scale)
-                else:
-                    hidden_states = self.Conv2d_0(hidden_states)
+        if isinstance(self.conv, LoRACompatibleConv) and not USE_PEFT_BACKEND:
+            hidden_states = self.conv(hidden_states, scale)
+        else:
+            hidden_states = self.conv(hidden_states)
 
         return hidden_states
